@@ -1,0 +1,582 @@
+"use client";
+
+import {
+  type FormEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+
+import AuthGate from "@/components/auth/AuthGate";
+import { useAuth } from "@/components/auth/AuthProvider";
+import GeneratedResultPanel from "@/components/predict/GeneratedResultPanel";
+import GenerationTimer from "@/components/predict/GenerationTimer";
+import ModelSelect, {
+  pickDefaultModelId,
+} from "@/components/predict/ModelSelect";
+import PredictHero from "@/components/predict/PredictHero";
+import Toast from "@/components/ui/Toast";
+import { validateSomaliArticle } from "@/lib/article-validation";
+import { apiFetch } from "@/lib/api";
+import { normalizeCategory } from "@/lib/categories";
+import { countWords, formatGeneratedHeadline } from "@/lib/text-format";
+import type {
+  GeneratedDraft,
+  HistoryItem,
+  ModelInfo,
+  ModelsResponse,
+  PredictionResult,
+  PublishNewsResponse,
+} from "@/lib/types";
+
+export default function PredictPage() {
+  const { token } = useAuth();
+  const [article, setArticle] = useState("");
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<GeneratedDraft | null>(null);
+  const [resultModalOpen, setResultModalOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [publishing, setPublishing] = useState(false);
+  const [savedId, setSavedId] = useState<string | null>(null);
+  const [publishedId, setPublishedId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<{
+    message: string;
+    type: "success" | "error";
+  } | null>(null);
+  const [validationMessage, setValidationMessage] = useState<string | null>(
+    null,
+  );
+  const [elapsedSeconds, setElapsedSeconds] = useState<number | null>(null);
+  const [finalSeconds, setFinalSeconds] = useState<number | null>(null);
+  const submitButtonRef = useRef<HTMLButtonElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const articleInputRef = useRef<HTMLTextAreaElement>(null);
+  const timerRef = useRef<number | null>(null);
+  const startTimeRef = useRef<number | null>(null);
+
+  const validation = useMemo(
+    () =>
+      article.trim()
+        ? validateSomaliArticle(article)
+        : { valid: false, message: null },
+    [article],
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function loadModels() {
+      try {
+        const data = await apiFetch<ModelsResponse>("/models", {
+          signal: controller.signal,
+        });
+        const availableModels = Array.isArray(data.models) ? data.models : [];
+
+        setModels(availableModels);
+        setSelectedModel(
+          pickDefaultModelId(availableModels, data.default_model),
+        );
+
+        if (availableModels.length === 0) {
+          setModelsError("No models are currently available.");
+        }
+      } catch (loadError) {
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        setModelsError(
+          loadError instanceof Error
+            ? loadError.message
+            : "Could not load the available models.",
+        );
+      } finally {
+        if (!controller.signal.aborted) {
+          setModelsLoading(false);
+        }
+      }
+    }
+
+    loadModels();
+
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== null) {
+        window.clearInterval(timerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!resultModalOpen) {
+      return;
+    }
+
+    const previousOverflow = document.body.style.overflow;
+    const submitButton = submitButtonRef.current;
+    document.body.style.overflow = "hidden";
+    closeButtonRef.current?.focus();
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape" && !saving && !publishing) {
+        setResultModalOpen(false);
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", handleKeyDown);
+      submitButton?.focus();
+    };
+  }, [resultModalOpen, saving, publishing]);
+
+  function clearTimer() {
+    if (timerRef.current !== null) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  }
+
+  function invalidateDraftIfChanged(nextArticle: string, nextModel?: string) {
+    if (!draft) {
+      return;
+    }
+
+    const articleChanged = nextArticle.trim() !== draft.article.trim();
+    const modelChanged =
+      nextModel !== undefined && nextModel !== draft.model_used;
+
+    if (articleChanged || modelChanged) {
+      setDraft(null);
+      setSavedId(null);
+      setPublishedId(null);
+      setResultModalOpen(false);
+      setFinalSeconds(null);
+      setElapsedSeconds(null);
+    }
+  }
+
+  function handleArticleChange(value: string) {
+    invalidateDraftIfChanged(value);
+    setArticle(value);
+    setValidationMessage(null);
+    setError(null);
+  }
+
+  function handleModelChange(modelId: string) {
+    invalidateDraftIfChanged(article, modelId);
+    setSelectedModel(modelId);
+  }
+
+  function handleEditArticle() {
+    setResultModalOpen(false);
+    window.setTimeout(() => {
+      articleInputRef.current?.focus();
+    }, 0);
+  }
+
+  function handleHeadlineChange(headline: string) {
+    setDraft((current) => (current ? { ...current, headline } : current));
+  }
+
+  function handleClearArticle() {
+    setArticle("");
+    setDraft(null);
+    setSavedId(null);
+    setPublishedId(null);
+    setResultModalOpen(false);
+    setValidationMessage(null);
+    setError(null);
+    articleInputRef.current?.focus();
+  }
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const trimmedArticle = article.trim();
+    if (!trimmedArticle || !selectedModel || !token) {
+      return;
+    }
+
+    const submitValidation = validateSomaliArticle(trimmedArticle);
+    if (!submitValidation.valid) {
+      setValidationMessage(submitValidation.message);
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setValidationMessage(null);
+    setDraft(null);
+    setResultModalOpen(false);
+    setSavedId(null);
+    setPublishedId(null);
+    setFinalSeconds(null);
+    setElapsedSeconds(0);
+    startTimeRef.current = performance.now();
+
+    clearTimer();
+    timerRef.current = window.setInterval(() => {
+      if (startTimeRef.current !== null) {
+        setElapsedSeconds((performance.now() - startTimeRef.current) / 1000);
+      }
+    }, 100);
+
+    try {
+      const data = await apiFetch<PredictionResult>("/predict", {
+        method: "POST",
+        token,
+        body: {
+          article: trimmedArticle,
+          model_id: selectedModel,
+        },
+      });
+
+      setFinalSeconds(data.generation_time_seconds);
+
+      if (data.status === "success" && data.headline) {
+        setDraft({
+          article: trimmedArticle,
+          headline: formatGeneratedHeadline(data.headline),
+          category: normalizeCategory(data.category),
+          model_used: data.model_used,
+          generation_time_seconds: data.generation_time_seconds,
+        });
+        setResultModalOpen(true);
+      } else if (data.error_message) {
+        setError(data.error_message);
+      }
+    } catch (submitError) {
+      setError(
+        submitError instanceof Error
+          ? submitError.message
+          : "Something went wrong while generating the headline.",
+      );
+    } finally {
+      clearTimer();
+      setElapsedSeconds(null);
+      setLoading(false);
+    }
+  }
+
+  async function handleSave() {
+    if (!draft || !token || saving || publishing || savedId || publishedId) {
+      return;
+    }
+
+    if (!draft.headline.trim()) {
+      return;
+    }
+
+    setSaving(true);
+    setToast(null);
+
+    try {
+      const response = await apiFetch<HistoryItem>("/history", {
+        method: "POST",
+        token,
+        body: {
+          article: draft.article,
+          headline: draft.headline,
+          category: draft.category,
+          model_used: draft.model_used,
+          generation_time_seconds: draft.generation_time_seconds ?? 0,
+        },
+      });
+
+      setSavedId(response.id);
+      setToast({
+        message: "Article saved to history",
+        type: "success",
+      });
+    } catch (saveError) {
+      setToast({
+        message:
+          saveError instanceof Error
+            ? saveError.message
+            : "Could not save the article.",
+        type: "error",
+      });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handlePublish() {
+    if (!draft || !token || saving || publishing || publishedId) {
+      return;
+    }
+
+    if (!draft.headline.trim()) {
+      return;
+    }
+
+    setPublishing(true);
+    setToast(null);
+
+    try {
+      const response = savedId
+        ? await apiFetch<PublishNewsResponse>(
+            `/history/${savedId}/publish`,
+            {
+              method: "POST",
+              token,
+              body: {
+                headline: draft.headline,
+              },
+            },
+          )
+        : await apiFetch<PublishNewsResponse>("/history/publish", {
+            method: "POST",
+            token,
+            body: {
+              article: draft.article,
+              headline: draft.headline,
+              category: draft.category,
+              model_used: draft.model_used,
+              generation_time_seconds: draft.generation_time_seconds ?? 0,
+            },
+          });
+
+      setPublishedId(response.id);
+      setSavedId(response.id);
+      setToast({
+        message: "Article published successfully",
+        type: "success",
+      });
+    } catch (publishError) {
+      setToast({
+        message:
+          publishError instanceof Error
+            ? publishError.message
+            : "Could not publish the article.",
+        type: "error",
+      });
+    } finally {
+      setPublishing(false);
+    }
+  }
+
+  const resultModelName =
+    models.find((model) => model.id === draft?.model_used)?.name ??
+    draft?.model_used ??
+    "";
+
+  const canSubmit =
+    article.trim().length > 0 &&
+    validation.valid &&
+    selectedModel &&
+    !modelsLoading &&
+    !loading;
+
+  return (
+    <AuthGate>
+      <main className="flex-1 bg-slate-50/50">
+        <PredictHero />
+
+        <div className="mx-auto max-w-4xl px-6 py-12">
+          <form
+            onSubmit={handleSubmit}
+            className="space-y-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8"
+          >
+            <ModelSelect
+              models={models}
+              selectedModel={selectedModel}
+              onChange={handleModelChange}
+              disabled={loading}
+              loading={modelsLoading}
+              error={modelsError}
+            />
+
+            <div>
+              <div className="mb-2 flex items-center justify-between gap-4">
+                <label
+                  htmlFor="article"
+                  className="block text-sm font-medium text-slate-700"
+                >
+                  Article text
+                </label>
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="text-xs text-slate-400">
+                    {article.length.toLocaleString()}{" "}
+                    {article.length === 1 ? "character" : "characters"}
+                  </span>
+                  <span className="text-xs text-slate-400">
+                    {countWords(article).toLocaleString()} words
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleClearArticle}
+                    disabled={!article || loading}
+                    className="rounded-md border border-red-600 bg-red-600 px-2.5 py-1 text-xs font-medium text-white transition-colors hover:border-red-700 hover:bg-red-700 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+              <textarea
+                ref={articleInputRef}
+                id="article"
+                name="article"
+                rows={12}
+                value={article}
+                onChange={(event) => handleArticleChange(event.target.value)}
+                placeholder="Paste your Somali news article here..."
+                disabled={loading}
+                aria-invalid={Boolean(
+                  validationMessage || (article.trim() && !validation.valid),
+                )}
+                aria-describedby="article-help article-validation"
+                className={`w-full resize-y rounded-lg border bg-white px-4 py-3 text-sm leading-relaxed text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-blue-600 disabled:bg-slate-50 disabled:text-slate-500 ${
+                  validationMessage || (article.trim() && !validation.valid)
+                    ? "border-red-300 focus:border-red-500"
+                    : "border-slate-200"
+                }`}
+              />
+              <p id="article-help" className="mt-2 text-xs text-slate-500">
+                Somali news articles only. English, Arabic, Swahili, math, and
+                symbol-heavy input are blocked before submission.
+              </p>
+              {article.trim() && !validation.valid && validation.message && (
+                <p
+                  id="article-validation"
+                  className="mt-2 text-sm text-red-600"
+                  role="alert"
+                >
+                  {validation.message}
+                </p>
+              )}
+              {validationMessage && (
+                <p className="mt-2 text-sm text-red-600" role="alert">
+                  {validationMessage}
+                </p>
+              )}
+            </div>
+
+            <button
+              ref={submitButtonRef}
+              type="submit"
+              disabled={!canSubmit}
+              className="flex w-full items-center justify-center gap-2 rounded-md border border-blue-600 bg-blue-600 px-4 py-3 text-sm font-medium text-white transition-colors hover:border-blue-700 hover:bg-blue-700 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
+            >
+              {loading && (
+                <span
+                  aria-hidden="true"
+                  className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white"
+                />
+              )}
+              {loading ? "Generating headline..." : "Generate headline"}
+            </button>
+
+            <GenerationTimer
+              loading={loading}
+              elapsedSeconds={elapsedSeconds}
+              finalSeconds={finalSeconds}
+            />
+
+            {draft && !resultModalOpen && (
+              <button
+                type="button"
+                onClick={() => setResultModalOpen(true)}
+                className="w-full rounded-md border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-blue-600 transition-colors hover:border-slate-300 hover:bg-slate-50"
+              >
+                View generated result
+              </button>
+            )}
+          </form>
+
+          {error && (
+            <div
+              className="mt-6 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700"
+              role="alert"
+            >
+              {error}
+            </div>
+          )}
+        </div>
+
+        {resultModalOpen && draft && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="result-modal-title"
+          >
+            <button
+              type="button"
+              aria-label="Close result"
+              onClick={() => setResultModalOpen(false)}
+              disabled={saving || publishing}
+              className="absolute inset-0 cursor-default bg-slate-950/45 backdrop-blur-[2px] disabled:cursor-not-allowed"
+            />
+
+            <div className="relative max-h-[calc(100dvh-2rem)] w-full max-w-2xl overflow-y-auto rounded-xl border border-slate-200 bg-white shadow-2xl">
+              <div className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-slate-200 bg-white px-6 py-5">
+                <div>
+                  <p className="mb-1 text-xs font-medium uppercase tracking-wide text-blue-600">
+                    Generated result
+                  </p>
+                  <h2
+                    id="result-modal-title"
+                    className="text-xl font-semibold text-slate-900"
+                  >
+                    Preview your headline
+                  </h2>
+                </div>
+                <button
+                  ref={closeButtonRef}
+                  type="button"
+                  onClick={() => setResultModalOpen(false)}
+                  disabled={saving || publishing}
+                  aria-label="Close result"
+                  className="rounded-md border border-slate-200 p-2 text-slate-500 transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-600 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <svg
+                    aria-hidden="true"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    className="h-4 w-4"
+                  >
+                    <path d="M4.22 4.22a.75.75 0 0 1 1.06 0L10 8.94l4.72-4.72a.75.75 0 1 1 1.06 1.06L11.06 10l4.72 4.72a.75.75 0 1 1-1.06 1.06L10 11.06l-4.72 4.72a.75.75 0 0 1-1.06-1.06L8.94 10 4.22 5.28a.75.75 0 0 1 0-1.06Z" />
+                  </svg>
+                </button>
+              </div>
+
+              <GeneratedResultPanel
+                draft={draft}
+                modelName={resultModelName}
+                onHeadlineChange={handleHeadlineChange}
+                onSave={handleSave}
+                onPublish={handlePublish}
+                onEdit={handleEditArticle}
+                saving={saving}
+                publishing={publishing}
+                savedId={savedId}
+                publishedId={publishedId}
+              />
+            </div>
+          </div>
+        )}
+
+        {toast && (
+          <Toast
+            message={toast.message}
+            type={toast.type}
+            onDismiss={() => setToast(null)}
+          />
+        )}
+      </main>
+    </AuthGate>
+  );
+}
